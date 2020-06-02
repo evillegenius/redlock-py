@@ -130,19 +130,19 @@ class Redlock(object):
         for error in redis_errors:
             warnings.warn('{}: {}'.format(type(error).__name__, error))
 
-    def lock_instance(self, server, resource, val, ttl):
+    def lock_instance(self, server, resource, key, ttl):
         # Note: returns True or None
         if not isinstance(ttl, int):
             raise TypeError('ttl {!r} is not an integer'.format(ttl))
-        return server.set(resource, val, nx=True, px=ttl)
+        return server.set(resource, key, nx=True, px=ttl)
 
-    def unlock_instance(self, server, resource, val):
+    def unlock_instance(self, server, resource, key):
         # Note: returns 1 == Success, 0 = No such resource, -1 = not lock owner
-        return server.eval(self.unlock_script, 1, resource, val)
+        return server.eval(self.unlock_script, 1, resource, key)
             
-    def extend_instance(self, server, resource, val, ttl):
+    def extend_instance(self, server, resource, key, ttl):
         # Note: returns 1 == Success, 0 = No such resource, -1 = not lock owner
-        return server.eval(self.extend_script, 1, resource, val, ttl)
+        return server.eval(self.extend_script, 1, resource, key, ttl)
      
     def query_instance(self, server, resource):
         values = server.eval(self.query_script, 1, resource)
@@ -153,9 +153,12 @@ class Redlock(object):
         CHARACTERS = string.ascii_letters + string.digits
         return ''.join(random.choice(CHARACTERS) for _ in range(22)).encode()
 
-    def lock(self, resource, ttl):
+    def lock(self, resource, ttl, key=None):
         retry = 0
-        val = self.get_unique_id()
+        if key is None:
+            key = self.get_unique_id()
+        elif hasattr(key, 'encode'):
+            key = key.encode()
 
         # Values in redis are binary
         if hasattr(resource, 'encode'):
@@ -168,7 +171,7 @@ class Redlock(object):
             del redis_errors[:]
             for server in self.servers:
                 try:
-                    if self.lock_instance(server, resource, val, ttl):
+                    if self.lock_instance(server, resource, key, ttl):
                         n += 1
                 except RedisError as e:
                     redis_errors.append(e)
@@ -178,11 +181,11 @@ class Redlock(object):
                 # We got a quorum but *may* have seen some errors. If so, warn
                 # the user about them.
                 self._warn(redis_errors)
-                return Lock(validity, resource, val)
+                return Lock(validity, resource, key)
             else:
                 for server in self.servers:
                     try:
-                        self.unlock_instance(server, resource, val)
+                        self.unlock_instance(server, resource, key)
                     except:
                         pass
                 retry += 1

@@ -18,6 +18,14 @@ class TestRedlock(unittest.TestCase):
         lock = self.redlock.lock("pants", 10)
         self.redlock.unlock(lock)
 
+    def test_lock_with_key(self):
+        lock = self.redlock.lock("pants", 100, key="denim")
+        self.assertEqual(lock.resource, b"pants")
+        self.assertEqual(lock.key, b"denim")
+        lock2 = self.redlock.query("pants")
+        self.assertEqual(lock2.key, b"denim")
+        self.redlock.unlock(lock)
+
     def test_blocked(self):
         lock = self.redlock.lock("pants", 1000)
         bad = self.redlock.lock("pants", 10)
