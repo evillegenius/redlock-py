@@ -1,7 +1,10 @@
 import unittest
 
-from redlock import Redlock, MultipleRedlockException
-
+from redlock import (Redlock,
+                     MultipleRedlockException,
+                     QuorumError,
+                     OwnerError,
+                     MissingError)
 
 class TestRedlock(unittest.TestCase):
 
@@ -22,16 +25,16 @@ class TestRedlock(unittest.TestCase):
         self.redlock.unlock(lock)
 
     def test_bad_connection_info(self):
-        with self.assertRaises(Warning):
+        with self.assertRaises(QuorumError):
             Redlock([{"cat": "hog"}])
 
     def test_py3_compatible_encoding(self):
         lock = self.redlock.lock("pants", 1000)
         key = self.redlock.servers[0].get("pants")
-        self.assertEquals(lock.key, key)
+        self.assertEqual(lock.key, key)
 
     def test_ttl_not_int_trigger_exception_value_error(self):
-        with self.assertRaises(ValueError):
+        with self.assertRaises(TypeError):
             self.redlock.lock("pants", 1000.0)
 
     def test_multiple_redlock_exception(self):
@@ -41,3 +44,7 @@ class TestRedlock(unittest.TestCase):
         exc_str = str(exc)
         self.assertIn('connection error', exc_str)
         self.assertIn('command timed out', exc_str)
+
+
+if __name__ == '__main__':
+    unittest.main()
