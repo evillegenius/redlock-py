@@ -61,7 +61,6 @@ class MissingError(LockError):
 class Redlock(object):
     default_retry_count = 3
     default_retry_delay = 0.2
-    clock_drift_factor = 0.01
 
     # Return 1 == "unlocked", 0 == "no such key", -1 == "not lock owner"
     unlock_script = """
@@ -79,11 +78,17 @@ class Redlock(object):
     local keyval = redis.call("get",KEYS[1])
     if keyval == ARGV[1] then
         return redis.call("pexpire",KEYS[1],ARGV[2])
-    elseif keyval == false
+    elseif keyval == false then
         return 0
     else
         return -1
     end"""
+
+    # Return a tuple of (ttl, resource, key). If the resource is not locked
+    # return (ttl <= 0, resource, None)
+    query_script = """
+    return {redis.call("pttl",KEYS[1]), KEYS[1], redis.call("get",KEYS[1])}
+    """
 
     def __init__(self, connection_list, retry_count=None, retry_delay=None):
         self.servers = []
@@ -136,16 +141,13 @@ class Redlock(object):
         return server.eval(self.unlock_script, 1, resource, val)
             
     def extend_instance(self, server, resource, val, ttl):
-        try:
-            return server.eval(self.extend_script, 1, resource, val, ttl) == 1
-        except Exception as e:
-            logging.exception("Error extending lock on resource %s in server %s", resource, str(server))
+        # Note: returns 1 == Success, 0 = No such resource, -1 = not lock owner
+        return server.eval(self.extend_script, 1, resource, val, ttl)
      
-    def test_instance(self, server, resource):
-        try:
-            return server.get(resource) is not None
-        except:
-            logging.exception("Error reading lock on resource %s in server %s", resource, str(server))   
+    def query_instance(self, server, resource):
+        values = server.eval(self.query_script, 1, resource)
+        # clamp the ttl value to 0
+        return Lock(max(values[0], 0), values[1], values[2])
 
     def get_unique_id(self):
         CHARACTERS = string.ascii_letters + string.digits
@@ -155,10 +157,9 @@ class Redlock(object):
         retry = 0
         val = self.get_unique_id()
 
-        # Add 2 milliseconds to the drift to account for Redis expires
-        # precision, which is 1 millisecond, plus 1 millisecond min
-        # drift for small TTLs.
-        drift = int(ttl * self.clock_drift_factor) + 2
+        # Values in redis are binary
+        if hasattr(resource, 'encode'):
+            resource = resource.encode()
 
         redis_errors = []
         while retry < self.retry_count:
@@ -172,7 +173,7 @@ class Redlock(object):
                 except RedisError as e:
                     redis_errors.append(e)
             elapsed_time = int(time.time() * 1000) - start_time
-            validity = int(ttl - elapsed_time - drift)
+            validity = int(ttl - elapsed_time)
             if validity > 0 and n >= self.quorum:
                 # We got a quorum but *may* have seen some errors. If so, warn
                 # the user about them.
@@ -245,7 +246,7 @@ class Redlock(object):
             # If we extended a quorum of servers then declare victory.
             self._warn(redis_errors)
             elapsed_time = int(time.time() * 1000) - start_time
-            validity = int(ttl - elapsed_time - drift)
+            validity = int(ttl - elapsed_time)
             return Lock(validity, lock.resource, lock.key)
         elif redis_errors:
             # Something failed internal to redis.
@@ -267,17 +268,44 @@ class Redlock(object):
             raise MissingError("The resource {} is not locked."
                                .format(lock.resource))
         
-    def test(self,name):
+    def query(self, resource):
+        # Values in redis are binary, convert resource if necessary
+        if hasattr(resource, 'encode'):
+            resource = resource.encode()
+
         redis_errors = []
-        lock=Lock(0,name,None)
-        n=0
+        locks = []
         for server in self.servers:
             try:
-                if self.test_instance(server, lock.resource):
-                    n+=1
+                lock = self.query_instance(server, resource)
             except RedisError as e:
                 redis_errors.append(e)
+                lock = Lock(0, resource, None)
+            locks.append(lock)
+
         if redis_errors:
             raise MultipleRedlockException(redis_errors)
-        return n>=self.quorum
+
+        # We may have different values in the list of locks, see if any of them
+        # have a quorum. Gather them by key.
+        counts = dict()
+        for lock in locks:
+            if lock.key in counts:
+                counts[lock.key] += 1
+            else:
+                counts[lock.key] = 1
+
+        maxCount, maxKey = max(((count, key) for key, count in counts.items()))
+
+        if maxCount >= self.quorum:
+            # We have a winner. Figure out the ttl time.
+            locks = [lock for lock in locks if lock.key == maxKey]
+            # Sort by ttl.
+            locks.sort()
+            # Return the lock whose expiration would cause us to lose our
+            # quorum.
+            return locks[-self.quorum]
+
+        # No one owns a quorum
+        return Lock(0, resource, None)
         

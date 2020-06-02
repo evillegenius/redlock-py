@@ -13,7 +13,7 @@ class TestRedlock(unittest.TestCase):
 
     def test_lock(self):
         lock = self.redlock.lock("pants", 100)
-        self.assertEqual(lock.resource, "pants")
+        self.assertEqual(lock.resource, b"pants")
         self.redlock.unlock(lock)
         lock = self.redlock.lock("pants", 10)
         self.redlock.unlock(lock)
@@ -30,7 +30,8 @@ class TestRedlock(unittest.TestCase):
 
     def test_py3_compatible_encoding(self):
         lock = self.redlock.lock("pants", 1000)
-        key = self.redlock.servers[0].get("pants")
+        key = self.redlock.servers[0].get(b"pants")
+        self.redlock.unlock(lock)
         self.assertEqual(lock.key, key)
 
     def test_ttl_not_int_trigger_exception_value_error(self):
@@ -45,6 +46,30 @@ class TestRedlock(unittest.TestCase):
         self.assertIn('connection error', exc_str)
         self.assertIn('command timed out', exc_str)
 
+    def test_query(self):
+        import time
+        lock = self.redlock.lock("pants", 100)
+        lock2 = self.redlock.query("pants")
+        self.assertTrue(lock2.validity <= lock.validity)
+        self.assertEqual(lock2.resource, lock.resource)
+        self.assertEqual(lock2.key, lock.key)
+
+        time.sleep(0.010)
+
+        lock2 = self.redlock.query("pants")
+        self.assertTrue(lock2.validity < lock.validity)
+        self.assertEqual(lock2.resource, lock.resource)
+        self.assertEqual(lock2.key, lock.key)
+
+        self.redlock.unlock(lock)
+
+    def test_extend(self):
+        lock = self.redlock.lock("pants", 100)
+        lock2 = self.redlock.extend(lock, 1000)
+        self.assertTrue(lock2.validity > lock.validity)
+        self.assertEqual(lock2.resource, lock.resource)
+        self.assertEqual(lock2.key, lock.key)
+        self.redlock.unlock(lock)
 
 if __name__ == '__main__':
     unittest.main()
