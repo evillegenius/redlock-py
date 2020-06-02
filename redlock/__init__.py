@@ -189,7 +189,10 @@ class Redlock(object):
                     except:
                         pass
                 retry += 1
-                time.sleep(self.retry_delay)
+                if retry < self.retry_count:
+                    # Sleep for retry_delay +/- 10%
+                    time.sleep(random.uniform(self.retry_delay * 0.9,
+                                              self.retry_delay * 1.1))
 
         if redis_errors:
             raise MultipleRedlockException(redis_errors)
