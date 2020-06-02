@@ -167,7 +167,7 @@ class Redlock(object):
         redis_errors = []
         while retry < self.retry_count:
             n = 0
-            start_time = int(time.time() * 1000)
+            start_time = time.time()
             del redis_errors[:]
             for server in self.servers:
                 try:
@@ -175,8 +175,8 @@ class Redlock(object):
                         n += 1
                 except RedisError as e:
                     redis_errors.append(e)
-            elapsed_time = int(time.time() * 1000) - start_time
-            validity = int(ttl - elapsed_time)
+            elapsed_ms = int((time.time() - start_time) * 1000)
+            validity = ttl - elapsed_ms
             if validity > 0 and n >= self.quorum:
                 # We got a quorum but *may* have seen some errors. If so, warn
                 # the user about them.
@@ -231,7 +231,7 @@ class Redlock(object):
     def extend(self, lock, ttl):
         redis_errors = []
         extended = missint = notowned = 0
-        start_time = int(time.time() * 1000)
+        start_time = time.time()
         for server in self.servers:
             try:
                 result = self.extend_instance(server, lock.resource, lock.key, ttl)
@@ -248,8 +248,8 @@ class Redlock(object):
         if extended >= self.quorum:
             # If we extended a quorum of servers then declare victory.
             self._warn(redis_errors)
-            elapsed_time = int(time.time() * 1000) - start_time
-            validity = int(ttl - elapsed_time)
+            elapsed_ms = int((time.time() - start_time) * 1000)
+            validity = ttl - elapsed_ms
             return Lock(validity, lock.resource, lock.key)
         elif redis_errors:
             # Something failed internal to redis.
