@@ -20,6 +20,9 @@ Lock = namedtuple("Lock", ("validity", "resource", "key"))
 
 
 class RedlockException(Exception):
+    """
+    Base class for all exceptions raised by the redlock package.
+    """
     pass
 
 class MultipleRedlockException(RedlockException):
@@ -59,10 +62,15 @@ class MissingError(LockError):
     pass
 
 class Redlock(object):
+    """
+    A Redlock class is the manager allowing you to lock, extend, and unlock
+    resources using a quorum of redis servers.
+    """
     default_retry_count = 3
     default_retry_delay = 0.2
 
-    # Return 1 == "unlocked", 0 == "no such key", -1 == "not lock owner"
+    # Lua script to execute on the redis server to unlock a resource.  Return
+    # 1 == "unlocked", 0 == "no such key", -1 == "not lock owner"
     unlock_script = """
     local keyval = redis.call("get",KEYS[1])
     if keyval == ARGV[1] then
@@ -73,7 +81,9 @@ class Redlock(object):
         return -1
     end"""
 
-    # Return 1 == "extended", 0 == "no such key", -1 == "not lock owner"
+    # Lua script to execute on the redis server to extend the lease on a
+    # resource.  Return 1 == "extended", 0 == "no such key", -1 == "not lock
+    # owner"
     extend_script = """
     local keyval = redis.call("get",KEYS[1])
     if keyval == ARGV[1] then
@@ -84,13 +94,38 @@ class Redlock(object):
         return -1
     end"""
 
+    # Lua script to execute on the redis server to query a resource lock.
     # Return a tuple of (ttl, resource, key). If the resource is not locked
-    # return (ttl <= 0, resource, None)
+    # return (ttl <= 0, resource, None).
     query_script = """
     return {redis.call("pttl",KEYS[1]), KEYS[1], redis.call("get",KEYS[1])}
     """
 
     def __init__(self, connection_list, retry_count=None, retry_delay=None):
+        """
+        Initialize the Redlock instance with a list of connections, and optionally
+        retry_count and retry_delay values.
+
+        The items in the connection_list must be one of:
+          * a string containing a redis connection url, see
+            redis.StrictRedis.from_url()
+          * a dict containing keyword arguments for redis.StrictRedis()
+          * an already connected redis.StrictRedis or redis.Redis instance.
+
+        If Redlock cannot ping a quorum of these connections (a strict majority
+        of them) then it will raise a QuorumError, otherwise it will be ready to
+        work with the quorum of servers to which it could connect.
+
+        When creating a lock, retry_count is the number of times that the server
+        will try (not actually retry) to obtain a lock. If retry_count = 1 then
+        only 1 attempt will be made to acquire a lock. If retry_count > 1 then
+        retry_delay is the approximate time in seconds to wait between
+        attempts. Approximate because the value is randomly perterbed to avoid
+        repeated contention should multiple clients attempt to acquire the lock
+        at the same time. If retry_count and/or retry_delay are not provided,
+        they default to trying 3 times with a delay of 0.2 seconds between
+        attempts.
+        """
         self.servers = []
         redis_errors = []
         for connection_info in connection_list:
@@ -131,29 +166,96 @@ class Redlock(object):
             warnings.warn('{}: {}'.format(type(error).__name__, error))
 
     def lock_instance(self, server, resource, key, ttl):
-        # Note: returns True or None
+        """
+        Acquire the lock on an individual server instance.
+
+        Returns True or None
+        """
         if not isinstance(ttl, int):
             raise TypeError('ttl {!r} is not an integer'.format(ttl))
         return server.set(resource, key, nx=True, px=ttl)
 
     def unlock_instance(self, server, resource, key):
-        # Note: returns 1 == Success, 0 = No such resource, -1 = not lock owner
+        """
+        Release the lock on an individual server instance.
+
+        Returns 1 == success, 0 == "no such resource", -1 == not lock owner.
+        """
         return server.eval(self.unlock_script, 1, resource, key)
-            
+
     def extend_instance(self, server, resource, key, ttl):
-        # Note: returns 1 == Success, 0 = No such resource, -1 = not lock owner
+        """
+        Extend the lease on the lock on an individual server instance.
+
+        Returns 1 == success, 0 == "no such resource", -1 == not lock owner.
+        """
         return server.eval(self.extend_script, 1, resource, key, ttl)
      
     def query_instance(self, server, resource):
+        """
+        Query the current state of a lock on an individual server instance.
+
+        Returns Lock(ttl, resource, key). If Lock.ttl == 0 then the resource is
+        no longer locked.
+
+        Note: Unlocked resources will typically return a value of None for
+        Lock.key, but if the resource has been randomly set on the redis server
+        by some other process then it may return the value of the resource as
+        the key or it may even raise an exception if the resource is not a
+        string.
+        """
         values = server.eval(self.query_script, 1, resource)
         # clamp the ttl value to 0
         return Lock(max(values[0], 0), values[1], values[2])
 
     def get_unique_id(self):
+        """
+        Provide a random unique string to be used as a key when the user did not
+        provide an explicit key to use when locking a resource. The string is
+        made up of a random sequence of ASCII letters and digits.
+        """
         CHARACTERS = string.ascii_letters + string.digits
         return ''.join(random.choice(CHARACTERS) for _ in range(22)).encode()
 
     def lock(self, resource, ttl, key=None):
+        """
+        Attempt to acquire a lock on a resource. The resource is actually the name
+        of a string valued key on a quorum of redis servers, so make sure to
+        pick a name that will not be used for other purposes on any of the
+        servers. If the resource name contains unicode text, it will be encoded
+        with utf-8 before being used on the redis server.
+
+        ttl is a "time to live" value as an integer number of milliseconds that
+        is the lease time on the lock. You may specify a large value, but there
+        are no perpetual locks and the value must be an integer. If the lease
+        expires, the redis servers will remove the resource key and the resource
+        will silently become unlocked. This is beneficial in the case of
+        crashing processes to ensure that the system will not become blocked
+        indefinitely, but it can be bad if you specify too short of a lease and
+        lose the lock before completing your operation. Choosing a good ttl
+        value is a trade off that you will have to consider. See also the
+        extend() method which will allow you to (possibly periodically) extend
+        the lease on the lock.
+
+        If the key argument is provided, it contains the unique string that will
+        be used to assert ownership of the lock. If the key value contains
+        unicode text, it will also be encoded to utf-8 before being used. A Lock
+        instance with this (encoded) value will be needed to unlock the
+        resource.  If the key argument is not provided, a random string of ASCII
+        letters and digits will be constructed and used as the key.
+
+        Lock will attempt to lock the resource on each of the servers that were
+        connected in the initializer up to retry_count times.. If it manages to
+        lock the resource on a majority of them then it considers the lock to be
+        obtained. If it cannot acquire the lock then it will delay for
+        approximately retry_delay seconds before making another attempt.
+
+        If it ultimately obtains the lock then it returns a Lock instance with
+        validity set to the approximate lease time in ms, resource set to the
+        encoded version of the resource name, and key set to the unique string.
+
+        If the lock cannot be obtained then False is returned.
+        """
         retry = 0
         if key is None:
             key = self.get_unique_id()
@@ -200,6 +302,15 @@ class Redlock(object):
         return False
 
     def unlock(self, lock):
+        """
+        Given a lock object returned from lock() or extend(), release the lock on
+        the resource. If the resource can be unlocked on any of the server
+        instance then True is returned. If the lock has presumably expired and
+        been acquired by someone else then an OwnerError is raised. Finally, if
+        the lock has expired and not been acquired a MissingError is
+        raised. Both OwnerError and MissingError derive from LockError so you
+        can catch LockError exceptions to catch both of them at once.
+        """
         redis_errors = []
         unlocked = missing = notowned = 0
         for server in self.servers:
@@ -232,6 +343,17 @@ class Redlock(object):
                                .format(lock.resource))
 
     def extend(self, lock, ttl):
+        """
+        Extend the lease on a resource with a new ttl value. If the lease can be
+        extended on a quorum of the redis servers then a new Lock will be
+        returned with validity set to the new approximate ttl value.
+
+        If the lease cannot be extended, raise an OwnerError or MissingError
+        exception like unlock does.
+
+        Note that if ttl <= 0, the lease on resource will expire immediately and
+        the resource will be unlocked.
+        """
         redis_errors = []
         extended = missint = notowned = 0
         start_time = time.time()
@@ -275,6 +397,19 @@ class Redlock(object):
                                .format(lock.resource))
         
     def query(self, resource):
+        """
+        Return a Lock instance representing the current lock state of the resource.
+        If the resource is locked on a quorum of the servers, a Lock instance is
+        returned with validity set to the ttl value at which the resource will
+        lose its quorum, the (encoded) resource name, and (encoded) key. If no
+        resource has a quorum, returns Lock(0, resource, None).
+
+        Because of the inherently ephemeral nature of locks, query should not be
+        used to determine who "currently" has a lock since that may have changed
+        by the time this method has returned. If you have a lock and you want to
+        ensure that it has not been lost, use extend() which will either extend
+        the lease on the lock or raise an exception.
+        """
         # Values in redis are binary, convert resource if necessary
         if hasattr(resource, 'encode'):
             resource = resource.encode()
